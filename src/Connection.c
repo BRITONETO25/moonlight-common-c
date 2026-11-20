@@ -2,32 +2,40 @@
 
 static int stage = STAGE_NONE;
 static ConnListenerConnectionTerminated originalTerminationCallback;
-static bool alreadyTerminated;
+static atomic_bool alreadyTerminated;
 static PLT_THREAD terminationCallbackThread;
 static int terminationCallbackErrorCode;
 
 // Common globals
 char* RemoteAddrString;
 struct sockaddr_storage RemoteAddr;
-SOCKADDR_LEN RemoteAddrLen;
+struct sockaddr_storage LocalAddr;
+SOCKADDR_LEN AddrLen;
 int AppVersionQuad[4];
 STREAM_CONFIGURATION StreamConfig;
 CONNECTION_LISTENER_CALLBACKS ListenerCallbacks;
 DECODER_RENDERER_CALLBACKS VideoCallbacks;
 AUDIO_RENDERER_CALLBACKS AudioCallbacks;
 int NegotiatedVideoFormat;
-volatile bool ConnectionInterrupted;
+atomic_bool ConnectionInterrupted;
 bool HighQualitySurroundSupported;
 bool HighQualitySurroundEnabled;
 OPUS_MULTISTREAM_CONFIGURATION NormalQualityOpusConfig;
 OPUS_MULTISTREAM_CONFIGURATION HighQualityOpusConfig;
-int OriginalVideoBitrate;
 int AudioPacketDuration;
 bool AudioEncryptionEnabled;
+bool ReferenceFrameInvalidationSupported;
 uint16_t RtspPortNumber;
 uint16_t ControlPortNumber;
 uint16_t AudioPortNumber;
 uint16_t VideoPortNumber;
+SS_PING AudioPingPayload;
+SS_PING VideoPingPayload;
+uint32_t ControlConnectData;
+uint32_t SunshineFeatureFlags;
+uint32_t EncryptionFeaturesSupported;
+uint32_t EncryptionFeaturesRequested;
+uint32_t EncryptionFeaturesEnabled;
 
 // Connection stages
 static const char* stageNames[STAGE_MAX] = {
@@ -151,13 +159,17 @@ static void ClInternalConnectionTerminated(int errorCode)
 {
     int err;
 
-    // Avoid recursion and issuing multiple callbacks
-    if (alreadyTerminated || ConnectionInterrupted) {
+    // Ensure only one thread triggers connection termination
+    if (atomic_exchange_explicit(&alreadyTerminated, true, memory_order_acq_rel)) {
+        return;
+    }
+
+    // If the connection is being stopped, no callback is needed
+    if (ConnectionInterrupted) {
         return;
     }
 
     terminationCallbackErrorCode = errorCode;
-    alreadyTerminated = true;
 
     // Invoke the termination callback on a separate thread
     err = PltCreateThread("AsyncTerm", terminationCallbackThreadFunc, NULL, &terminationCallbackThread);
@@ -167,8 +179,18 @@ static void ClInternalConnectionTerminated(int errorCode)
         LC_ASSERT(err == 0);
     }
 
-    // Close the thread handle since we can never wait on it
-    PltCloseThread(&terminationCallbackThread);
+#if defined(__SWITCH__)
+    // libnx has no pthread_detach(), so a detached thread is never released
+    // and the leaked handle crashes the process when the app exits or is
+    // relaunched. Wait for the callback instead: on Switch the termination
+    // callback must return quickly and must not call LiStopConnection().
+    if (err == 0) {
+        PltJoinThread(&terminationCallbackThread);
+    }
+#else
+    // Detach the thread since we never wait on it
+    PltDetachThread(&terminationCallbackThread);
+#endif
 }
 
 static bool parseRtspPortNumberFromUrl(const char* rtspSessionUrl, uint16_t* port)
@@ -203,14 +225,31 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     void* audioContext, int arFlags) {
     int err;
 
-    if ((drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && drCallbacks->submitDecodeUnit) {
+    if (drCallbacks != NULL && (drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && drCallbacks->submitDecodeUnit) {
         Limelog("CAPABILITY_PULL_RENDERER cannot be set with a submitDecodeUnit callback\n");
+        LC_ASSERT(false);
         err = -1;
         goto Cleanup;
     }
 
-    if ((drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && (drCallbacks->capabilities & CAPABILITY_DIRECT_SUBMIT)) {
+    if (drCallbacks != NULL && (drCallbacks->capabilities & CAPABILITY_PULL_RENDERER) && (drCallbacks->capabilities & CAPABILITY_DIRECT_SUBMIT)) {
         Limelog("CAPABILITY_PULL_RENDERER and CAPABILITY_DIRECT_SUBMIT cannot be set together\n");
+        LC_ASSERT(false);
+        err = -1;
+        goto Cleanup;
+    }
+
+    if (serverInfo->serverCodecModeSupport == 0) {
+        Limelog("serverCodecModeSupport field in SERVER_INFORMATION must be set!\n");
+        LC_ASSERT(false);
+        err = -1;
+        goto Cleanup;
+    }
+
+    // Extract the appversion from the supplied string
+    if (extractVersionQuadFromString(serverInfo->serverInfoAppVersion,
+                                     AppVersionQuad) < 0) {
+        Limelog("Invalid appversion string: %s\n", serverInfo->serverInfoAppVersion);
         err = -1;
         goto Cleanup;
     }
@@ -233,9 +272,9 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     memcpy(&ListenerCallbacks, clCallbacks, sizeof(ListenerCallbacks));
     ListenerCallbacks.connectionTerminated = ClInternalConnectionTerminated;
 
+    memset(&LocalAddr, 0, sizeof(LocalAddr));
     NegotiatedVideoFormat = 0;
     memcpy(&StreamConfig, streamConfig, sizeof(StreamConfig));
-    OriginalVideoBitrate = streamConfig->bitrate;
     RemoteAddrString = strdup(serverInfo->address);
 
     // The values in RTSP SETUP will be used to populate these.
@@ -284,7 +323,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     }
 
     // Dimensions over 4096 are only supported with HEVC on NVENC
-    if (!StreamConfig.supportsHevc &&
+    if (!(StreamConfig.supportedVideoFormats & ~VIDEO_FORMAT_MASK_H264) &&
             (StreamConfig.width > 4096 || StreamConfig.height > 4096)) {
         Limelog("WARNING: Streaming at resolutions above 4K using H.264 will likely fail! Trying anyway!\n");
     }
@@ -298,19 +337,12 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     // resolutions will work and which won't, but we can at least exclude
     // 4K from RFI to avoid significant persistent artifacts after frame loss.
     if (StreamConfig.width == 3840 && StreamConfig.height == 2160 &&
-            (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC)) {
-        Limelog("Disabling reference frame invalidation for 4K streaming\n");
+            (VideoCallbacks.capabilities & CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC) &&
+            !IS_SUNSHINE()) {
+        Limelog("Disabling reference frame invalidation for 4K streaming with GFE\n");
         VideoCallbacks.capabilities &= ~CAPABILITY_REFERENCE_FRAME_INVALIDATION_AVC;
     }
     
-    // Extract the appversion from the supplied string
-    if (extractVersionQuadFromString(serverInfo->serverInfoAppVersion,
-                                     AppVersionQuad) < 0) {
-        Limelog("Invalid appversion string: %s\n", serverInfo->serverInfoAppVersion);
-        err = -1;
-        goto Cleanup;
-    }
-
     Limelog("Initializing platform...");
     ListenerCallbacks.stageStarting(STAGE_PLATFORM_INIT);
     err = initializePlatform();
@@ -326,18 +358,52 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Resolving host name...");
     ListenerCallbacks.stageStarting(STAGE_NAME_RESOLUTION);
-    err = resolveHostName(serverInfo->address, AF_UNSPEC, 47984, &RemoteAddr, &RemoteAddrLen);
-    if (err != 0) {
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 47989, &RemoteAddr, &RemoteAddrLen);
+    LC_ASSERT(RtspPortNumber != 0);
+    if (RtspPortNumber != 48010) {
+        // If we have an alternate RTSP port, use that as our test port. The host probably
+        // isn't listening on 47989 or 47984 anyway, since they're using alternate ports.
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, RtspPortNumber, &RemoteAddr, &AddrLen);
+        if (err != 0) {
+            // Sleep for a second and try again. It's possible that we've attempt to connect
+            // before the host has gotten around to listening on the RTSP port. Give it some
+            // time before retrying.
+            PltSleepMs(1000);
+            err = resolveHostName(serverInfo->address, AF_UNSPEC, RtspPortNumber, &RemoteAddr, &AddrLen);
+        }
     }
-    if (err != 0) {
-        err = resolveHostName(serverInfo->address, AF_UNSPEC, 48010, &RemoteAddr, &RemoteAddrLen);
+    else {
+        // We use TCP 47984 and 47989 first here because we know those should always be listening
+        // on hosts using the standard ports.
+        //
+        // TCP 48010 is a last resort because:
+        // a) it's not always listening and there's a race between listen() on the host and our connect()
+        // b) it's not used at all by certain host versions which perform RTSP over ENet
+        err = resolveHostName(serverInfo->address, AF_UNSPEC, 47984, &RemoteAddr, &AddrLen);
+        if (err != 0) {
+            err = resolveHostName(serverInfo->address, AF_UNSPEC, 47989, &RemoteAddr, &AddrLen);
+        }
+        if (err != 0) {
+            err = resolveHostName(serverInfo->address, AF_UNSPEC, 48010, &RemoteAddr, &AddrLen);
+        }
     }
     if (err != 0) {
         Limelog("failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_NAME_RESOLUTION, err);
         goto Cleanup;
     }
+
+    // Resolve LocalAddr by RemoteAddr.
+    {
+        SOCKADDR_LEN localAddrLen;
+        err = getLocalAddressByUdpConnect(&RemoteAddr, AddrLen, RtspPortNumber, &LocalAddr, &localAddrLen);
+        if (err != 0) {
+            Limelog("failed to resolve local addr: %d\n", err);
+            ListenerCallbacks.stageFailed(STAGE_NAME_RESOLUTION, err);
+            goto Cleanup;
+        }
+        LC_ASSERT(localAddrLen == AddrLen);
+    }
+
     stage++;
     LC_ASSERT(stage == STAGE_NAME_RESOLUTION);
     ListenerCallbacks.stageComplete(STAGE_NAME_RESOLUTION);
@@ -347,17 +413,27 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     // now that we have resolved the target address and impose the video packet
     // size cap if required.
     if (StreamConfig.streamingRemotely == STREAM_CFG_AUTO) {
-        if (isPrivateNetworkAddress(&RemoteAddr)) {
+        bool isNat64 = isNat64SynthesizedAddress(&RemoteAddr);
+
+        // It's possible to have a NAT64 prefix on a ULA or other private range,
+        // so we must exclude NAT64 addresses from our local address checks.
+        if (!isNat64 && isPrivateNetworkAddress(&RemoteAddr)) {
             StreamConfig.streamingRemotely = STREAM_CFG_LOCAL;
         }
         else {
             StreamConfig.streamingRemotely = STREAM_CFG_REMOTE;
 
-            if (StreamConfig.packetSize > 1024) {
-                // Cap packet size at 1024 for remote streaming to avoid
-                // MTU problems and fragmentation.
-                Limelog("Packet size capped at 1KB for remote streaming\n");
+            if (RemoteAddr.ss_family == AF_INET || isNat64) {
+                // Cap packet size at 1024 for remote IPv4 streaming to avoid fragmentation.
+                Limelog("Packet size capped at 1024 bytes for remote IPv4 streaming\n");
                 StreamConfig.packetSize = 1024;
+            }
+            else {
+                // IPv6 guarantees a minimum MTU of 1280 before fragmentation, so use a higher
+                // packet size cap for remote IPv6 streaming (when not using NAT64 which isn't
+                // end-to-end IPv6 traffic).
+                Limelog("Packet size capped at 1184 bytes for remote IPv6 streaming\n");
+                StreamConfig.packetSize = 1184;
             }
         }
     }
@@ -377,7 +453,7 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
 
     Limelog("Starting RTSP handshake...");
     ListenerCallbacks.stageStarting(STAGE_RTSP_HANDSHAKE);
-    err = performRtspHandshake();
+    err = performRtspHandshake(serverInfo);
     if (err != 0) {
         Limelog("failed: %d\n", err);
         ListenerCallbacks.stageFailed(STAGE_RTSP_HANDSHAKE, err);
@@ -483,4 +559,10 @@ Cleanup:
         LiStopConnection();
     }
     return err;
+}
+
+const char* LiGetLaunchUrlQueryParameters(void) {
+    // v0 = Video encryption and control stream encryption v2
+    // v1 = RTSP encryption
+    return "&corever=1";
 }

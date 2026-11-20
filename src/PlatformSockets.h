@@ -1,13 +1,32 @@
 #pragma once
 
 #include "Limelight.h"
-#include "Platform.h"
+#include "PlatformStuff.h"
+#ifdef __3DS__
+#include <netinet/in.h>
 
-#ifdef _WIN32
+#ifdef AF_INET6
+#undef AF_INET6
+#endif
+
+extern in_port_t n3ds_udp_port;
+#endif
+
+#ifdef __vita__
+#ifdef AF_INET6
+#undef AF_INET6
+#endif
+#endif
+
+#if defined(_WIN32) && !defined(NXDK)
 #define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
+#include <windows.h>
 #include <wlanapi.h>
+#ifndef __MINGW32__
 #include <timeapi.h>
+#else
+#include <mmsystem.h>
+#endif
 #define SetLastSocketError(x) WSASetLastError(x)
 #define LastSocketError() WSAGetLastError()
 
@@ -23,10 +42,30 @@
 #endif
 #define EINTR WSAEINTR
 
+#ifdef EWOULDBLOCK
+#undef EWOULDBLOCK
+#endif
 #define EWOULDBLOCK WSAEWOULDBLOCK
+
+#ifdef EINPROGRESS
+#undef EINPROGRESS
+#endif
 #define EINPROGRESS WSAEINPROGRESS
+
+#ifdef ETIMEDOUT
+#undef ETIMEDOUT
+#endif
 #define ETIMEDOUT WSAETIMEDOUT
+
+#ifdef ECONNREFUSED
+#undef ECONNREFUSED
+#endif
 #define ECONNREFUSED WSAECONNREFUSED
+
+#ifdef EMSGSIZE
+#undef EMSGSIZE
+#endif
+#define EMSGSIZE WSAEMSGSIZE
 
 typedef int SOCK_RET;
 typedef int SOCKADDR_LEN;
@@ -42,26 +81,11 @@ typedef int SOCKADDR_LEN;
 #include <netdb.h>
 #include <errno.h>
 #include <signal.h>
-#if defined(__vita__)
-#define POLLIN      0x0001
-#define POLLPRI     0x0002
-#define POLLOUT     0x0004
-#define POLLERR     0x0008
-#define POLLRDNORM  0x0040
-#define POLLWRNORM  POLLOUT
-#define POLLRDBAND  0x0080
-#define POLLWRBAND  0x0100
-
-struct pollfd {
-    int fd;
-    short events;
-    short revents;
-};
-#else
 #include <poll.h>
-#endif
 
+#ifndef ioctlsocket
 #define ioctlsocket ioctl
+#endif
 #define LastSocketError() errno
 #define SetLastSocketError(x) errno = x
 #define INVALID_SOCKET -1
@@ -74,9 +98,11 @@ typedef socklen_t SOCKADDR_LEN;
 
 #ifdef AF_INET6
 typedef struct sockaddr_in6 LC_SOCKADDR;
+#define SET_FAMILY(addr, family) ((addr)->sin6_family = (family))
 #define SET_PORT(addr, port) ((addr)->sin6_port = htons(port))
 #else
 typedef struct sockaddr_in LC_SOCKADDR;
+#define SET_FAMILY(addr, family) ((addr)->sin_family = (family))
 #define SET_PORT(addr, port) ((addr)->sin_port = htons(port))
 #endif
 
@@ -88,19 +114,27 @@ typedef struct sockaddr_in LC_SOCKADDR;
 #else
 #define URLSAFESTRING_LEN INET_ADDRSTRLEN
 #endif
-void addrToUrlSafeString(struct sockaddr_storage* addr, char* string);
+void addrToUrlSafeString(struct sockaddr_storage* addr, char* string, size_t stringLength);
+
+#define SOCK_QOS_TYPE_BEST_EFFORT 0
+#define SOCK_QOS_TYPE_AUDIO 1
+#define SOCK_QOS_TYPE_VIDEO 2
 
 SOCKET createSocket(int addressFamily, int socketType, int protocol, bool nonBlocking);
 SOCKET connectTcpSocket(struct sockaddr_storage* dstaddr, SOCKADDR_LEN addrlen, unsigned short port, int timeoutSec);
+int getLocalAddressByUdpConnect(const struct sockaddr_storage* targetAddr, SOCKADDR_LEN targetAddrLen,  unsigned short targetPort,
+                                struct sockaddr_storage* localAddr, SOCKADDR_LEN* localAddrLen);
 int sendMtuSafe(SOCKET s, char* buffer, int size);
-SOCKET bindUdpSocket(int addrfamily, int bufferSize);
+SOCKET bindUdpSocket(int addressFamily, struct sockaddr_storage* localAddr, SOCKADDR_LEN addrLen, int bufferSize, int socketQosType);
 int enableNoDelay(SOCKET s);
 int setSocketNonBlocking(SOCKET s, bool enabled);
-int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect);
+int recvUdpSocket(SOCKET s, char* buffer, int size, bool useSelect,
+                  struct sockaddr_storage* remoteAddr, SOCKADDR_LEN* addrLen);
 void shutdownTcpSocket(SOCKET s);
 int setNonFatalRecvTimeoutMs(SOCKET s, int timeoutMs);
 void closeSocket(SOCKET s);
 bool isPrivateNetworkAddress(struct sockaddr_storage* address);
+bool isNat64SynthesizedAddress(struct sockaddr_storage* address);
 int pollSockets(struct pollfd* pollFds, int pollFdsCount, int timeoutMs);
 bool isSocketReadable(SOCKET s);
 

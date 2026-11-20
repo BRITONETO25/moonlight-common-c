@@ -1,16 +1,27 @@
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.1...4.0)
 project(moonlight-common-c LANGUAGES C)
 
+string(TOUPPER "x${CMAKE_BUILD_TYPE}" BUILD_TYPE)
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 option(USE_MBEDTLS "Use MbedTLS instead of OpenSSL" OFF)
+option(CODE_ANALYSIS "Run code analysis during compilation" OFF)
 
 SET(CMAKE_C_STANDARD 11)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE_BACKUP ${CMAKE_POSITION_INDEPENDENT_CODE})
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+add_subdirectory(enet)
+set(CMAKE_POSITION_INDEPENDENT_CODE ${CMAKE_POSITION_INDEPENDENT_CODE_BACKUP})
+unset(CMAKE_POSITION_INDEPENDENT_CODE_BACKUP)
+
 aux_source_directory(src SRC_LIST)
-aux_source_directory(enet SRC_LIST)
-aux_source_directory(reedsolomon SRC_LIST)
+list(APPEND SRC_LIST
+  nanors/rs.c
+  nanors/deps/obl/oblas_common.c
+  nanors/deps/obl/oblas_lite.c
+)
 
 # Build shared library by default, but allows user override
 if (NOT DEFINED BUILD_SHARED_LIBS)
@@ -25,22 +36,38 @@ if (BUILD_SHARED_LIBS_OVERRIDE)
   unset(BUILD_SHARED_LIBS_OVERRIDE)
 endif()
 
+target_link_libraries(moonlight-common-c PRIVATE enet)
+
 if(MSVC)
-  target_compile_options(moonlight-common-c PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX)
+  target_compile_options(moonlight-common-c PRIVATE /W3 /wd4100 /wd4232 /wd5105 /WX /experimental:c11atomics)
   target_link_libraries(moonlight-common-c PRIVATE ws2_32.lib winmm.lib)
+elseif(MINGW)
+  target_link_libraries(moonlight-common-c PRIVATE -lws2_32 -lwinmm)
 else()
-  target_compile_options(moonlight-common-c PRIVATE -Wall -Wextra -Wno-unused-parameter -Werror)
+  target_compile_options(moonlight-common-c PRIVATE -Wall -Wextra -Wno-unused-parameter)
+  if (CODE_ANALYSIS AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(moonlight-common-c PRIVATE -fanalyzer)
+  endif()
 endif()
 
 if (USE_MBEDTLS)
   target_compile_definitions(moonlight-common-c PRIVATE USE_MBEDTLS)
-  find_package(MbedTLS QUIET)
-  if (MBEDTLS_FOUND)
-    target_link_libraries(moonlight-common-c PRIVATE ${MBEDCRYPTO_LIBRARY})
-    target_include_directories(moonlight-common-c SYSTEM PRIVATE ${MBEDTLS_INCLUDE_DIRS})
+  if (TARGET MbedTLS::mbedcrypto)
+    target_link_libraries(moonlight-common-c PRIVATE MbedTLS::mbedcrypto)
   else()
-    # For sub project added via CMake
-    target_link_libraries(moonlight-common-c PRIVATE mbedtls)
+    find_package(MbedTLS CONFIG QUIET)
+    if (TARGET MbedTLS::mbedcrypto)
+      target_link_libraries(moonlight-common-c PRIVATE MbedTLS::mbedcrypto)
+    else()
+      find_package(MbedTLS QUIET)
+      if (MBEDTLS_FOUND)
+        target_link_libraries(moonlight-common-c PRIVATE ${MBEDCRYPTO_LIBRARY})
+        target_include_directories(moonlight-common-c SYSTEM PRIVATE ${MBEDTLS_INCLUDE_DIRS})
+      else()
+        # For sub project added via CMake
+        target_link_libraries(moonlight-common-c PRIVATE mbedcrypto)
+      endif()
+    endif()
   endif()
 else()
   find_package(OpenSSL 1.0.2 REQUIRED)
@@ -48,7 +75,6 @@ else()
   target_include_directories(moonlight-common-c SYSTEM PRIVATE ${OPENSSL_INCLUDE_DIR})
 endif()
 
-string(TOUPPER "x${CMAKE_BUILD_TYPE}" BUILD_TYPE)
 if("${BUILD_TYPE}" STREQUAL "XDEBUG")
   target_compile_definitions(moonlight-common-c PRIVATE LC_DEBUG)
 else()
@@ -63,9 +89,10 @@ endif()
 
 target_include_directories(moonlight-common-c SYSTEM PUBLIC src)
 
-target_include_directories(moonlight-common-c PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/enet/include
-  ${CMAKE_CURRENT_SOURCE_DIR}/reedsolomon
+target_include_directories(moonlight-common-c SYSTEM PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/nanors
+  ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps
+  ${CMAKE_CURRENT_SOURCE_DIR}/nanors/deps/obl
 )
 
 target_compile_definitions(moonlight-common-c PRIVATE HAS_SOCKLEN_T)
